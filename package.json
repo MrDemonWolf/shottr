@@ -1,0 +1,15 @@
+{
+  "name": "mrdemonwolf-image-cdn",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MrDemonWolf, Inc. — R2 Image CDN Worker for img.mrdemonwolf.com",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241205.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^3.99.0"
+  }
+}

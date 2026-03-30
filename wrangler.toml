@@ -1,0 +1,14 @@
+# MrDemonWolf, Inc. — Image CDN Worker
+name = "mrdemonwolf-image-cdn"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+# Custom domain
+routes = [
+  { pattern = "img.mrdemonwolf.com/*", zone_name = "mrdemonwolf.com" }
+]
+
+# R2 bucket binding
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "shottr"
