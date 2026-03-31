@@ -8,6 +8,8 @@ routes = [
   { pattern = "img.mrdemonwolf.com/*", zone_name = "mrdemonwolf.com" }
 ]
 
+# Auth secret — set via: npx wrangler secret put AUTH_TOKEN
+
 # R2 bucket binding
 [[r2_buckets]]
 binding = "BUCKET"
