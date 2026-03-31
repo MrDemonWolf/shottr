@@ -90,10 +90,11 @@ Built to keep image delivery fast and infrastructure simple.
 
 ```
 .
-├── index.ts        # Worker entry point (all request handling)
-├── wrangler.toml   # Cloudflare Worker config, routes, and R2 binding
-├── tsconfig.json   # TypeScript compiler options
-└── package.json    # Scripts and dev dependencies
+├── src/
+│   └── index.ts      # Worker entry point (all request handling)
+├── wrangler.toml     # Cloudflare Worker config, routes, and R2 binding
+├── tsconfig.json     # TypeScript compiler options
+└── package.json      # Scripts and dev dependencies
 ```
 
 ## License

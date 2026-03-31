@@ -5,6 +5,7 @@
 
 export interface Env {
   BUCKET: R2Bucket;
+  AUTH_TOKEN: string;
 }
 
 const BUCKET_NAME = "shottr";
@@ -52,6 +53,17 @@ export default {
       });
     }
 
+    // Auth gate for mutating requests
+    if (request.method === "PUT" || request.method === "DELETE") {
+      const token = request.headers.get("Authorization")?.replace("Bearer ", "");
+      if (!env.AUTH_TOKEN || token !== env.AUTH_TOKEN) {
+        return new Response("Unauthorized", {
+          status: 401,
+          headers: corsHeaders(request),
+        });
+      }
+    }
+
     // Upload
     if (request.method === "PUT") {
       await env.BUCKET.put(key, request.body, {
@@ -94,7 +106,7 @@ export default {
       const headers = new Headers({
         "Content-Type":
           obj.httpMetadata?.contentType ?? "application/octet-stream",
-        ETag: obj.httpMetadata?.contentEncoding ?? obj.etag,
+        ETag: obj.etag,
         "Cache-Control": "public, max-age=31536000, immutable",
         ...corsHeaders(request),
       });
