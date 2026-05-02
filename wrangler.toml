@@ -8,7 +8,8 @@ routes = [
   { pattern = "img.mrdemonwolf.com/*", zone_name = "mrdemonwolf.com" }
 ]
 
-# Auth secret — set via: npx wrangler secret put AUTH_TOKEN
+# S3 access key ID — set via: npx wrangler secret put S3_ACCESS_KEY_ID
+# (optional) S3 secret key — set via: npx wrangler secret put S3_SECRET_ACCESS_KEY
 
 # R2 bucket binding
 [[r2_buckets]]

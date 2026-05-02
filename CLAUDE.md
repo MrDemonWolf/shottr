@@ -19,6 +19,8 @@ No test runner is configured.
 
 - **Entry point:** `src/index.ts`
 - **R2 binding:** `env.BUCKET` → bucket `shottr`
+- **Auth:** PUT/DELETE require `Authorization: AWS4-HMAC-SHA256 Credential=<S3_ACCESS_KEY_ID>/...` (S3 SigV4 header shape). Access key ID must match `env.S3_ACCESS_KEY_ID`. Full signature is not verified — single-tenant CDN. Set with `npx wrangler secret put S3_ACCESS_KEY_ID`.
+- **S3 compatibility:** Errors return S3 XML (`<Error><Code/>...</Error>`); `GET /` returns empty `ListBucketResult`; `GET /?location` returns `LocationConstraint`. Lets S3 clients (e.g. Shottr) pass their connection test.
 - **CORS:** Only `https://mrdemonwolf.com` and `https://www.mrdemonwolf.com` receive `Access-Control-Allow-Origin`; all other origins get CORS headers without the allow-origin header.
 - **Key resolution:** `resolveKey()` strips a leading `shottr/` prefix from the URL path so both `/image.png` and `/shottr/image.png` resolve to the same object.
 - **Cache:** Served objects get `Cache-Control: public, max-age=31536000, immutable`.
