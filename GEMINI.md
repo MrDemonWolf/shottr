@@ -1,7 +1,7 @@
 # GEMINI.md - MrDemonWolf Image CDN
 
 ## Project Overview
-This project is a Cloudflare Worker that serves as an image CDN for `img.mrdemonwolf.com`. It acts as a proxy for a Cloudflare R2 bucket named `mrdemonwolf-images`.
+This project is a Cloudflare Worker that serves as an image CDN for `img.mrdemonwolf.com`. It acts as a proxy for a Cloudflare R2 bucket named `shottr`.
 
 ### Core Features:
 - **Image Serving:** Proxies GET and HEAD requests to retrieve images from the R2 bucket.
