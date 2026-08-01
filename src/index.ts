@@ -1,15 +1,21 @@
 /**
  * MrDemonWolf, Inc. — Image CDN Worker
  * Proxies R2 bucket for img.mrdemonwolf.com
- * Validates S3 SigV4 on uploads (header) and presigned GETs (query string).
+ * Verifies S3 SigV4 on uploads (header) and presigned GETs (query string).
  */
 
-import { checkSigV4Header, verifyPresigned } from "./sigv4";
+import { verifyAuthHeader, verifyPresigned } from "./sigv4";
 
 export interface Env {
   BUCKET: R2Bucket;
   S3_ACCESS_KEY_ID: string;
   S3_SECRET_ACCESS_KEY: string;
+  /**
+   * Optional. When set, enables `Authorization: Bearer <token>` uploads
+   * (PUT only, image extensions only) for clients that can't sign SigV4,
+   * e.g. Apple Shortcuts. Unset = the path is disabled.
+   */
+  SHORTCUTS_UPLOAD_TOKEN?: string;
 }
 
 const BUCKET_NAME = "shottr";
@@ -17,6 +23,22 @@ const ALLOWED_ORIGINS = [
   "https://mrdemonwolf.com",
   "https://www.mrdemonwolf.com",
 ];
+const MAX_KEY_LENGTH = 1024;
+
+// Bearer-token uploads are limited to plain image types — the token is
+// embedded in a shareable .shortcut file, so its blast radius stays small.
+const BEARER_UPLOAD_EXTENSIONS = /\.(png|jpe?g|gif|webp|heic)$/i;
+
+// Preflight-only headers; browsers never need these on actual responses.
+const PREFLIGHT_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Methods": "GET, HEAD, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers":
+    "Content-Type, Authorization, x-amz-content-sha256, x-amz-date, x-amz-acl",
+  "Access-Control-Max-Age": "86400",
+};
+
+const LOCATION_XML = `<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">auto</LocationConstraint>`;
+const LIST_XML = `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>${BUCKET_NAME}</Name><MaxKeys>0</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>`;
 
 const NOT_FOUND_HTML = (key: string) => `<!doctype html>
 <html lang="en"><head>
@@ -36,8 +58,10 @@ const NOT_FOUND_HTML = (key: string) => `<!doctype html>
  a:hover{text-decoration:underline}
  .brand{margin-top:20px;padding-top:16px;border-top:1px solid rgba(207,212,219,.15);
         font-size:12px;color:#64748B}
+ .logo{display:block;width:56px;height:56px;margin-bottom:16px}
 </style></head><body>
 <div class="card">
+  <img class="logo" src="https://www.mrdemonwolf.com/wp-content/uploads/2022/12/cropped-logo-white-border-192x192.png" alt="MrDemonWolf logo">
   <h1>▲ 404 · object not found</h1>
   <p>key: <code>${escapeHtml(key) || "(empty)"}</code></p>
   <p><a href="https://mrdemonwolf.com">← mrdemonwolf.com</a></p>
@@ -57,170 +81,294 @@ function wantsHtml(request: Request): boolean {
   return (request.headers.get("Accept") ?? "").includes("text/html");
 }
 
-function corsHeaders(request: Request): Record<string, string> {
+function preflightHeaders(request: Request): Headers {
+  const headers = new Headers(PREFLIGHT_HEADERS);
   const origin = request.headers.get("Origin") ?? "";
-  const headers: Record<string, string> = {
-    "Access-Control-Allow-Methods": "GET, HEAD, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers":
-      "Content-Type, Authorization, x-amz-content-sha256, x-amz-date, x-amz-acl",
-    "Access-Control-Max-Age": "86400",
-  };
   if (ALLOWED_ORIGINS.includes(origin)) {
-    headers["Access-Control-Allow-Origin"] = origin;
+    headers.set("Access-Control-Allow-Origin", origin);
   }
   return headers;
 }
 
-function s3Error(
-  code: string,
-  message: string,
-  status: number,
-  request: Request,
-): Response {
+function s3Error(code: string, message: string, status: number): Response {
   const body = `<?xml version="1.0" encoding="UTF-8"?><Error><Code>${code}</Code><Message>${message}</Message></Error>`;
   return new Response(body, {
     status,
     headers: {
       "Content-Type": "application/xml",
       "Cache-Control": "no-store",
-      ...corsHeaders(request),
+      "Access-Control-Allow-Origin": "*",
+      "X-Content-Type-Options": "nosniff",
     },
   });
 }
 
-function resolveKey(url: URL): string {
-  let key = decodeURIComponent(url.pathname.slice(1));
+function xmlResponse(body: string, isHead: boolean): Response {
+  return new Response(isHead ? null : body, {
+    headers: {
+      "Content-Type": "application/xml",
+      "Access-Control-Allow-Origin": "*",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
+function notFound(request: Request, key: string): Response {
+  // Browser navigation gets the branded HTML 404; S3 clients get XML.
+  if (request.method === "GET" && wantsHtml(request)) {
+    return new Response(NOT_FOUND_HTML(key), {
+      status: 404,
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin": "*",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy":
+          "default-src 'none'; style-src 'unsafe-inline'; img-src https://www.mrdemonwolf.com",
+      },
+    });
+  }
+  return s3Error("NoSuchKey", "The specified key does not exist.", 404);
+}
+
+/**
+ * Resolve the object key from the URL path, stripping an optional
+ * `<bucket>/` prefix so path-style S3 clients and bare CDN URLs agree.
+ * Returns null when the path contains malformed percent-escapes.
+ */
+export function resolveKey(url: URL): string | null {
+  let key: string;
+  try {
+    key = decodeURIComponent(url.pathname.slice(1));
+  } catch {
+    return null;
+  }
   if (key.startsWith(`${BUCKET_NAME}/`)) {
     key = key.slice(`${BUCKET_NAME}/`.length);
   }
   return key;
 }
 
+/**
+ * Timing-safe check of a Bearer upload token. Both sides are hashed
+ * first so the comparison length never depends on the real token.
+ */
+export async function verifyUploadToken(
+  presented: string,
+  expected: string | undefined,
+): Promise<boolean> {
+  if (!expected) return false;
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(presented)),
+    crypto.subtle.digest("SHA-256", enc.encode(expected)),
+  ]);
+  const av = new Uint8Array(a);
+  const bv = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < av.length; i++) diff |= av[i] ^ bv[i];
+  return diff === 0;
+}
+
+/** Normalized edge-cache key: object key only, no query string. */
+function cacheKeyFor(url: URL, key: string): Request {
+  const path = key.split("/").map(encodeURIComponent).join("/");
+  return new Request(`https://${url.host}/${path}`, { method: "GET" });
+}
+
+function objectHeaders(obj: R2Object, presigned: boolean): Headers {
+  const headers = new Headers();
+  obj.writeHttpMetadata(headers);
+  if (!headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/octet-stream");
+  }
+  headers.set("ETag", obj.httpEtag);
+  headers.set("Last-Modified", obj.uploaded.toUTCString());
+  headers.set("Content-Length", String(obj.size));
+  headers.set("Accept-Ranges", "bytes");
+  // Presigned responses: short private cache so expiry means something.
+  // Unsigned responses: long-lived immutable cache (public CDN behavior).
+  headers.set(
+    "Cache-Control",
+    presigned ? "private, max-age=60" : "public, max-age=31536000, immutable",
+  );
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("Content-Security-Policy", "default-src 'none'; sandbox");
+  return headers;
+}
+
+function contentRange(range: R2Range, size: number): { start: number; end: number } {
+  if ("suffix" in range) {
+    return { start: size - range.suffix, end: size - 1 };
+  }
+  const start = range.offset ?? 0;
+  const end =
+    range.length !== undefined ? start + range.length - 1 : size - 1;
+  return { start, end };
+}
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
     const url = new URL(request.url);
-    const key = resolveKey(url);
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders(request) });
+      return new Response(null, {
+        status: 204,
+        headers: preflightHeaders(request),
+      });
     }
 
     if (request.method === "PUT" || request.method === "DELETE") {
-      if (!checkSigV4Header(request, env)) {
+      const authz = request.headers.get("Authorization") ?? "";
+      const bearer = authz.startsWith("Bearer ");
+
+      if (bearer) {
+        // Apple Shortcuts path: static token, uploads only — never DELETE.
+        if (request.method !== "PUT") {
+          return s3Error(
+            "AccessDenied",
+            "Bearer tokens may only upload objects.",
+            403,
+          );
+        }
+        const ok = await verifyUploadToken(
+          authz.slice("Bearer ".length),
+          env.SHORTCUTS_UPLOAD_TOKEN,
+        );
+        if (!ok) {
+          return s3Error("InvalidAccessKeyId", "Invalid upload token.", 403);
+        }
+      } else {
+        const verify = await verifyAuthHeader(request, url, env);
+        if (!verify.ok) {
+          return s3Error(verify.code, verify.message, 403);
+        }
+      }
+
+      const key = resolveKey(url);
+      if (key === null) {
+        return s3Error("InvalidURI", "Couldn't parse the specified URI.", 400);
+      }
+      if (key === "" || key.length > MAX_KEY_LENGTH) {
+        return s3Error("InvalidRequest", "Missing or invalid object key.", 400);
+      }
+      if (bearer && !BEARER_UPLOAD_EXTENSIONS.test(key)) {
         return s3Error(
-          "InvalidAccessKeyId",
-          "The AWS access key ID you provided does not exist in our records.",
-          403,
-          request,
+          "InvalidRequest",
+          "Upload token only accepts image files.",
+          400,
         );
       }
-    }
 
-    if (request.method === "PUT") {
-      const obj = await env.BUCKET.put(key, request.body, {
-        httpMetadata: {
-          contentType:
-            request.headers.get("Content-Type") ?? "application/octet-stream",
-        },
-      });
+      if (request.method === "PUT") {
+        const obj = await env.BUCKET.put(key, request.body, {
+          httpMetadata: {
+            contentType:
+              request.headers.get("Content-Type") ?? "application/octet-stream",
+          },
+        });
+        // Drop any stale cached copy on overwrite.
+        ctx.waitUntil(caches.default.delete(cacheKeyFor(url, key)));
+        const headers = new Headers({ "Access-Control-Allow-Origin": "*" });
+        if (obj?.httpEtag) headers.set("ETag", obj.httpEtag);
+        return new Response(null, { status: 200, headers });
+      }
+
+      await env.BUCKET.delete(key);
+      ctx.waitUntil(caches.default.delete(cacheKeyFor(url, key)));
       return new Response(null, {
-        status: 200,
-        headers: {
-          ETag: obj?.etag ? `"${obj.etag}"` : "",
-          ...corsHeaders(request),
-        },
+        status: 204,
+        headers: { "Access-Control-Allow-Origin": "*" },
       });
-    }
-
-    // GET /?location — S3 bucket location probe
-    if (
-      request.method === "GET" &&
-      key === "" &&
-      url.searchParams.has("location")
-    ) {
-      return new Response(
-        `<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">auto</LocationConstraint>`,
-        {
-          headers: {
-            "Content-Type": "application/xml",
-            ...corsHeaders(request),
-          },
-        },
-      );
-    }
-
-    // GET / — list (empty) so S3 clients accept the connection test
-    if (request.method === "GET" && key === "") {
-      return new Response(
-        `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>${BUCKET_NAME}</Name><MaxKeys>0</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>`,
-        {
-          headers: {
-            "Content-Type": "application/xml",
-            ...corsHeaders(request),
-          },
-        },
-      );
     }
 
     if (request.method === "GET" || request.method === "HEAD") {
       const verify = await verifyPresigned(request, url, env);
       if (!verify.ok) {
-        return s3Error(verify.code, verify.message, 403, request);
+        return s3Error(verify.code, verify.message, 403);
       }
 
-      const obj = await env.BUCKET.get(key);
-      if (!obj) {
-        // Browser navigation gets the branded HTML 404; S3 clients get XML.
-        if (request.method === "GET" && wantsHtml(request)) {
-          return new Response(NOT_FOUND_HTML(key), {
-            status: 404,
-            headers: {
-              "Content-Type": "text/html; charset=utf-8",
-              "Cache-Control": "no-store",
-              ...corsHeaders(request),
-            },
-          });
+      const key = resolveKey(url);
+      if (key === null) {
+        return s3Error("InvalidURI", "Couldn't parse the specified URI.", 400);
+      }
+
+      // S3 client connection probes against the bucket root.
+      if (key === "") {
+        const isHead = request.method === "HEAD";
+        return url.searchParams.has("location")
+          ? xmlResponse(LOCATION_XML, isHead)
+          : xmlResponse(LIST_XML, isHead);
+      }
+
+      if (request.method === "HEAD") {
+        const head = await env.BUCKET.head(key);
+        if (!head) return notFound(request, key);
+        return new Response(null, {
+          headers: objectHeaders(head, verify.presigned),
+        });
+      }
+
+      const cacheable = !verify.presigned && !request.headers.has("Range");
+      const cacheKey = cacheKeyFor(url, key);
+
+      if (cacheable) {
+        const hit = await caches.default.match(cacheKey);
+        if (hit) {
+          const inm = request.headers.get("If-None-Match");
+          const etag = hit.headers.get("ETag");
+          if (inm && etag && inm.includes(etag)) {
+            const headers = new Headers(hit.headers);
+            headers.delete("Content-Length");
+            return new Response(null, { status: 304, headers });
+          }
+          return hit;
         }
+      }
+
+      let obj: R2ObjectBody | R2Object | null;
+      try {
+        obj = await env.BUCKET.get(key, {
+          onlyIf: request.headers,
+          range: request.headers.has("Range") ? request.headers : undefined,
+        });
+      } catch {
         return s3Error(
-          "NoSuchKey",
-          "The specified key does not exist.",
-          404,
-          request,
+          "InvalidRange",
+          "The requested range is not satisfiable.",
+          416,
         );
       }
+      if (!obj) return notFound(request, key);
 
-      // Presigned responses: short cache so expiry is honored at edge.
-      // Unsigned responses: long-lived immutable cache (public CDN behavior).
-      const cacheControl = verify.presigned
-        ? "private, max-age=60"
-        : "public, max-age=31536000, immutable";
+      const headers = objectHeaders(obj, verify.presigned);
 
-      const headers = new Headers({
-        "Content-Type":
-          obj.httpMetadata?.contentType ?? "application/octet-stream",
-        ETag: `"${obj.etag}"`,
-        "Cache-Control": cacheControl,
-        ...corsHeaders(request),
-      });
+      // Precondition triggered (e.g. If-None-Match matched): body is absent.
+      if (!("body" in obj)) {
+        headers.delete("Content-Length");
+        const status = request.headers.has("If-None-Match") ? 304 : 412;
+        return new Response(null, { status, headers });
+      }
 
-      return new Response(request.method === "HEAD" ? null : obj.body, {
-        headers,
-      });
+      if (obj.range) {
+        const { start, end } = contentRange(obj.range, obj.size);
+        headers.set("Content-Range", `bytes ${start}-${end}/${obj.size}`);
+        headers.set("Content-Length", String(end - start + 1));
+        return new Response(obj.body, { status: 206, headers });
+      }
+
+      const response = new Response(obj.body, { headers });
+      if (cacheable) {
+        ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
+      }
+      return response;
     }
 
-    if (request.method === "DELETE") {
-      await env.BUCKET.delete(key);
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders(request),
-      });
-    }
-
-    return s3Error(
-      "MethodNotAllowed",
-      "The specified method is not allowed.",
-      405,
-      request,
-    );
+    return s3Error("MethodNotAllowed", "The specified method is not allowed.", 405);
   },
 } satisfies ExportedHandler<Env>;
