@@ -338,11 +338,16 @@ export default {
           range: request.headers.has("Range") ? request.headers : undefined,
         });
       } catch {
-        return s3Error(
-          "InvalidRange",
-          "The requested range is not satisfiable.",
-          416,
-        );
+        // Only a Range request can legitimately fail with 416; anything
+        // else that throws here is an R2/runtime failure, not client error.
+        if (request.headers.has("Range")) {
+          return s3Error(
+            "InvalidRange",
+            "The requested range is not satisfiable.",
+            416,
+          );
+        }
+        return s3Error("InternalError", "Failed to read the object.", 500);
       }
       if (!obj) return notFound(request, key);
 
@@ -351,8 +356,13 @@ export default {
       // Precondition triggered (e.g. If-None-Match matched): body is absent.
       if (!("body" in obj)) {
         headers.delete("Content-Length");
-        const status = request.headers.has("If-None-Match") ? 304 : 412;
-        return new Response(null, { status, headers });
+        // If-None-Match / If-Modified-Since are conditional-GET validators:
+        // an unmet condition means "not modified". If-Match and
+        // If-Unmodified-Since are guards: an unmet condition is a failure.
+        const notModified =
+          request.headers.has("If-None-Match") ||
+          request.headers.has("If-Modified-Since");
+        return new Response(null, { status: notModified ? 304 : 412, headers });
       }
 
       if (obj.range) {

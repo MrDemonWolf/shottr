@@ -120,7 +120,10 @@ function canonicalQueryString(url: URL, omit?: string): string {
     if (k === omit) continue;
     params.push([k, v]);
   }
-  params.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  // SigV4: sort by name, then by value for repeated names.
+  params.sort(([a, av], [b, bv]) =>
+    a < b ? -1 : a > b ? 1 : av < bv ? -1 : av > bv ? 1 : 0,
+  );
   return params.map(([k, v]) => `${rfc3986(k)}=${rfc3986(v)}`).join("&");
 }
 
