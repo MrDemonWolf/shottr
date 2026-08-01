@@ -1,15 +1,34 @@
 # MrDemonWolf, Inc. — Image CDN Worker
 name = "shottr"
 main = "src/index.ts"
-compatibility_date = "2024-12-01"
+compatibility_date = "2026-07-01"
 
-# Custom domain
+# Only serve via the custom domain — no *.workers.dev origin.
+workers_dev = false
+preview_urls = false
+
+# Minify the deployed bundle.
+minify = true
+
+# Custom domain (requires a proxied DNS record for img.mrdemonwolf.com)
 routes = [
   { pattern = "img.mrdemonwolf.com/*", zone_name = "mrdemonwolf.com" }
 ]
 
-# S3 access key ID — set via: npx wrangler secret put S3_ACCESS_KEY_ID
-# (optional) S3 secret key — set via: npx wrangler secret put S3_SECRET_ACCESS_KEY
+# REQUIRED secrets — writes are rejected and presigned reads fail without them:
+#   npx wrangler secret put S3_ACCESS_KEY_ID
+#   npx wrangler secret put S3_SECRET_ACCESS_KEY
+# OPTIONAL — enables Bearer-token uploads from Apple Shortcuts (PUT only):
+#   npx wrangler secret put SHORTCUTS_UPLOAD_TOKEN
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+# Hard per-request CPU cap. Requires the Workers Standard (paid) plan —
+# comment out on the Free plan (which already enforces a 10 ms cap).
+[limits]
+cpu_ms = 50
 
 # R2 bucket binding
 [[r2_buckets]]
