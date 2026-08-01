@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import aws4 from "aws4";
 import {
   verifyPresigned,
-  checkSigV4Header,
+  verifyAuthHeader,
+  timingSafeEqual,
   parseAmzDate,
   rfc3986,
   canonicalUri,
@@ -192,36 +193,220 @@ describe("verifyPresigned", () => {
   });
 });
 
-describe("checkSigV4Header", () => {
-  it("accepts a SigV4 Authorization header with matching access key", () => {
-    const request = new Request("https://example/", {
+/** Sign a header-auth request with aws4 and return the Request + URL. */
+function signHeaderRequest(opts?: {
+  method?: string;
+  path?: string;
+  contentSha?: string;
+  accessKeyId?: string;
+  secretAccessKey?: string;
+  mutateHeaders?: (headers: Headers) => void;
+  requestPath?: string;
+}): { request: Request; url: URL } {
+  const method = opts?.method ?? "PUT";
+  const path = opts?.path ?? PATH;
+  const signed = aws4.sign(
+    {
+      service: "s3",
+      region: "auto",
+      host: HOST,
+      method,
+      path,
       headers: {
-        Authorization: `AWS4-HMAC-SHA256 Credential=${CREDS.S3_ACCESS_KEY_ID}/20260501/auto/s3/aws4_request, SignedHeaders=host, Signature=deadbeef`,
+        "Content-Type": "image/png",
+        "X-Amz-Content-Sha256": opts?.contentSha ?? "UNSIGNED-PAYLOAD",
       },
-    });
-    expect(checkSigV4Header(request, CREDS)).toBe(true);
+    },
+    {
+      accessKeyId: opts?.accessKeyId ?? CREDS.S3_ACCESS_KEY_ID,
+      secretAccessKey: opts?.secretAccessKey ?? CREDS.S3_SECRET_ACCESS_KEY,
+    },
+  );
+  const headers = new Headers();
+  for (const [k, v] of Object.entries(
+    signed.headers as Record<string, string>,
+  )) {
+    if (k.toLowerCase() === "host") continue; // fetch derives Host from the URL
+    headers.set(k, v);
+  }
+  opts?.mutateHeaders?.(headers);
+  const fullUrl = `https://${HOST}${opts?.requestPath ?? path}`;
+  const url = new URL(fullUrl);
+  const request = new Request(fullUrl, { method, headers });
+  return { request, url };
+}
+
+describe("verifyAuthHeader", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-01T12:00:00Z"));
   });
 
-  it("rejects a Bearer header", () => {
-    const request = new Request("https://example/", {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("accepts a signed PUT with UNSIGNED-PAYLOAD", async () => {
+    const { request, url } = signHeaderRequest();
+    const result = await verifyAuthHeader(request, url, CREDS);
+    expect(result).toEqual({ ok: true, presigned: false });
+  });
+
+  it("accepts a signed PUT with a declared payload hash", async () => {
+    // The declared hash is used verbatim in the canonical request — the body
+    // itself is not verified (streaming uploads are never buffered).
+    const { request, url } = signHeaderRequest({
+      contentSha:
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+    });
+    const result = await verifyAuthHeader(request, url, CREDS);
+    expect(result).toEqual({ ok: true, presigned: false });
+  });
+
+  it("accepts a signed DELETE", async () => {
+    const { request, url } = signHeaderRequest({ method: "DELETE" });
+    const result = await verifyAuthHeader(request, url, CREDS);
+    expect(result).toEqual({ ok: true, presigned: false });
+  });
+
+  it("verifies repeat requests via the memoized signing key", async () => {
+    const first = signHeaderRequest();
+    const second = signHeaderRequest({ method: "DELETE" });
+    expect((await verifyAuthHeader(first.request, first.url, CREDS)).ok).toBe(
+      true,
+    );
+    expect((await verifyAuthHeader(second.request, second.url, CREDS)).ok).toBe(
+      true,
+    );
+  });
+
+  it("rejects a missing Authorization header", async () => {
+    const url = new URL(`https://${HOST}${PATH}`);
+    const request = new Request(url.toString(), { method: "PUT" });
+    const result = await verifyAuthHeader(request, url, CREDS);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("AccessDenied");
+  });
+
+  it("rejects a Bearer header", async () => {
+    const url = new URL(`https://${HOST}${PATH}`);
+    const request = new Request(url.toString(), {
+      method: "PUT",
       headers: { Authorization: "Bearer some-token" },
     });
-    expect(checkSigV4Header(request, CREDS)).toBe(false);
+    const result = await verifyAuthHeader(request, url, CREDS);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("AuthorizationHeaderMalformed");
   });
 
-  it("rejects a SigV4 header with a different access key", () => {
-    const request = new Request("https://example/", {
-      headers: {
-        Authorization:
-          "AWS4-HMAC-SHA256 Credential=AKIA_OTHER/20260501/auto/s3/aws4_request, SignedHeaders=host, Signature=deadbeef",
-      },
+  it("rejects a wrong access key", async () => {
+    const { request, url } = signHeaderRequest();
+    const result = await verifyAuthHeader(request, url, {
+      ...CREDS,
+      S3_ACCESS_KEY_ID: "AKIA_WRONG_KEY",
     });
-    expect(checkSigV4Header(request, CREDS)).toBe(false);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("InvalidAccessKeyId");
   });
 
-  it("rejects a missing Authorization header", () => {
-    const request = new Request("https://example/");
-    expect(checkSigV4Header(request, CREDS)).toBe(false);
+  it("rejects a signature made with the wrong secret", async () => {
+    const { request, url } = signHeaderRequest({
+      secretAccessKey: "not-the-real-secret-not-the-real-secret1234",
+    });
+    const result = await verifyAuthHeader(request, url, CREDS);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("SignatureDoesNotMatch");
+  });
+
+  it("rejects a tampered path", async () => {
+    const { request, url } = signHeaderRequest({
+      requestPath: "/shottr/other.png",
+    });
+    const result = await verifyAuthHeader(request, url, CREDS);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("SignatureDoesNotMatch");
+  });
+
+  it("rejects a tampered signed header", async () => {
+    const { request, url } = signHeaderRequest({
+      mutateHeaders: (h) => h.set("Content-Type", "text/html"),
+    });
+    const result = await verifyAuthHeader(request, url, CREDS);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("SignatureDoesNotMatch");
+  });
+
+  it("rejects a tampered query string", async () => {
+    const { request } = signHeaderRequest();
+    const url = new URL(`https://${HOST}${PATH}?attacker=1`);
+    const result = await verifyAuthHeader(request, url, CREDS);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("SignatureDoesNotMatch");
+  });
+
+  it("rejects a tampered declared payload hash", async () => {
+    const { request, url } = signHeaderRequest({
+      mutateHeaders: (h) =>
+        h.set(
+          "X-Amz-Content-Sha256",
+          "0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+    });
+    const result = await verifyAuthHeader(request, url, CREDS);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("SignatureDoesNotMatch");
+  });
+
+  it("rejects a request outside the clock-skew window", async () => {
+    const { request, url } = signHeaderRequest();
+    vi.setSystemTime(new Date("2026-05-01T12:16:01Z"));
+    const result = await verifyAuthHeader(request, url, CREDS);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("RequestTimeTooSkewed");
+  });
+
+  it("rejects a missing x-amz-date header", async () => {
+    const { request: signedReq, url } = signHeaderRequest();
+    const headers = new Headers(signedReq.headers);
+    headers.delete("X-Amz-Date");
+    const request = new Request(url.toString(), { method: "PUT", headers });
+    const result = await verifyAuthHeader(request, url, CREDS);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("InvalidRequest");
+  });
+
+  it("rejects a missing x-amz-content-sha256 header", async () => {
+    const { request: signedReq, url } = signHeaderRequest();
+    const headers = new Headers(signedReq.headers);
+    headers.delete("X-Amz-Content-Sha256");
+    const request = new Request(url.toString(), { method: "PUT", headers });
+    const result = await verifyAuthHeader(request, url, CREDS);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("InvalidRequest");
+  });
+
+  it("rejects when secret is not configured server-side", async () => {
+    const { request, url } = signHeaderRequest();
+    const result = await verifyAuthHeader(request, url, {
+      ...CREDS,
+      S3_SECRET_ACCESS_KEY: "",
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("InternalError");
+  });
+});
+
+describe("timingSafeEqual", () => {
+  it("returns true for equal strings", () => {
+    expect(timingSafeEqual("deadbeef", "deadbeef")).toBe(true);
+  });
+
+  it("returns false for different strings of equal length", () => {
+    expect(timingSafeEqual("deadbeef", "deadbeee")).toBe(false);
+  });
+
+  it("returns false on length mismatch", () => {
+    expect(timingSafeEqual("deadbeef", "deadbee")).toBe(false);
   });
 });
 
