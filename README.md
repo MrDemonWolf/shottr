@@ -164,9 +164,11 @@ the route, so the record's target is a placeholder.
 
 ### 6. Deploy and smoke-test
 
-```bash
-bun run deploy
-```
+Deploys run only from GitHub Actions on `main`; `bun run deploy` refuses
+to run on a laptop. Add `CLOUDFLARE_API_TOKEN` (Workers Scripts, Workers
+Routes and R2 edit) and `CLOUDFLARE_ACCOUNT_ID` as secrets on the
+`production` environment, then merge to `main`. The **Deploy** workflow
+runs once **CI** passes.
 
 The deploy script tries the full config first; if Cloudflare rejects
 the `[limits]` CPU cap (Free plan), it automatically retries without

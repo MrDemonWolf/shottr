@@ -10,13 +10,17 @@ A Cloudflare Worker that proxies a Cloudflare R2 bucket (`shottr`) as an image C
 
 ```bash
 bun run dev        # Local dev via wrangler dev (local R2 simulation)
-bun run deploy     # Deploy via scripts/deploy.mjs (auto-drops [limits] on Free plan)
+bun run deploy     # GitHub Actions on main only (refused on a laptop); scripts/deploy.mjs auto-drops [limits] on Free plan
 bun run typecheck  # tsc --noEmit
 bun run test       # Vitest suite (tests/), uses aws4 as signing oracle
 bun run build      # wrangler deploy --dry-run --outdir=dist
 ```
 
-CI (`.github/workflows/ci.yml`) runs typecheck, test, and dry-run build with Bun.
+CI (`.github/workflows/ci.yml`) runs typecheck, test, and dry-run build with Bun on every PR. `.github/workflows/deploy.yml` deploys after CI passes on `main`.
+
+## Deploy rule
+
+**Never deploy from a laptop.** Production changes reach Cloudflare only through the GitHub Actions deploy workflow, on `main`, after the `CI / Verify` check has passed on the pull request and on the merge. `main` requires a pull request and that check, and the `production` environment accepts deployments from `main` only. The deploy script exits unless `GITHUB_ACTIONS=true` and `GITHUB_REF=refs/heads/main`. Do not run `wrangler deploy` or any other production write by hand, and never weaken these guards to ship a change — open a pull request.
 
 ## Key details
 
