@@ -11,6 +11,7 @@
  *
  * Any extra CLI arguments are passed through to `wrangler deploy`.
  */
+import "./require-ci-main.mjs";
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";

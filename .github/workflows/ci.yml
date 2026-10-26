@@ -1,13 +1,18 @@
 name: CI
 
+# Every pull request and every push to main. `CI / Verify` is the required
+# check on main; Deploy runs only after this succeeds on a push to main.
 on:
   push:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   verify:
-    name: Typecheck, Test & Build
+    name: CI / Verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
